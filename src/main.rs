@@ -23,6 +23,7 @@ fn main() -> ResultType<()> {
         -r, --relay-servers=[HOST] 'Sets the default relay servers, separated by comma'
         -M, --rmem=[NUMBER(default={RMEM})] 'Sets UDP recv buffer size, set system rmem_max first, e.g., sudo sysctl -w net.core.rmem_max=52428800. vi /etc/sysctl.conf, net.core.rmem_max=52428800, sudo sysctl –p'
         , --mask=[MASK] '[DEPRECATED] Determine if the connection comes from LAN, e.g. 192.168.0.0/16'
+        -a, --api=[URL] 'api-server 地址，如 http://127.0.0.1:21115；配置后启用 IP 级出站许可（fail-closed），未配置则失败打开并告警'
         -k, --key=[KEY] 'Only allow the client with the same key'",
     );
     init_args(&args, "hbbs", "RustDesk ID/Rendezvous Server");
@@ -40,6 +41,7 @@ fn main() -> ResultType<()> {
         serial,
         &get_arg_or("key", "-".to_owned()),
         rmem,
+        get_arg_opt("api"),
     )?;
     Ok(())
 }

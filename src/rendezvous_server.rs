@@ -69,6 +69,151 @@ struct PunchReqEntry { tm: Instant, from_ip: String, to_ip: String, to_id: Strin
 static PUNCH_REQS: Lazy<TokioMutex<Vec<PunchReqEntry>>> = Lazy::new(|| TokioMutex::new(Vec::new()));
 const PUNCH_REQ_DEDUPE_SEC: u64 = 60;
 
+// 出站许可（M2）：IP 级流水，注册时验证，未登录/未授权拒绝出站（fail-closed）。
+// 复核语义=源 IP；缓存窗口 10 分钟，周期任务每 5 分钟刷新允许或重试瞬时故障。
+const SESSION_REQUIRED_FAIL: &str = "session_required";
+const OUTBOUND_GRANT_SECS: u64 = 600;
+const OUTBOUND_RETRY_SECS: u64 = 300;
+#[derive(Clone)]
+struct OutboundIp {
+    token: String,
+    allowed: bool,
+    last: Instant,
+}
+static OUTBOUND_IPS: Lazy<TokioMutex<HashMap<IpAddr, OutboundIp>>> = Lazy::new(|| TokioMutex::new(HashMap::new()));
+// 瞬时故障（api-server 不可达/超时）待重试的 IP→token
+static PENDING_OUTBOUND_IPS: Lazy<TokioMutex<HashMap<IpAddr, String>>> =
+    Lazy::new(|| TokioMutex::new(HashMap::new()));
+
+// 每次校验都先满足已允许的新鲜窗口，减少对 api-server 的请求
+async fn ip_outbound_allowed(ip: IpAddr) -> bool {
+    let map = OUTBOUND_IPS.lock().await;
+    match map.get(&ip) {
+        Some(e) => e.allowed && e.last.elapsed().as_secs() < OUTBOUND_GRANT_SECS,
+        None => false,
+    }
+}
+
+// 向 api-server 校验出站 token，含 5 秒超时。
+// Ok(true)=有效、Ok(false)=明确拒绝（token 无效/过期/IP 不匹配）、Err=瞬时故障
+async fn verify_outbound_api(api_url: &str, token: &str, ip: &str) -> Result<bool, ()> {
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            log::error!("outbound verify: build client failed: {}", e);
+            return Err(());
+        }
+    };
+    let url = format!("{}/api/verify-session", api_url.trim_end_matches('/'));
+    let resp = match client
+        .post(&url)
+        .json(&serde_json::json!({"token": token, "ip": ip}))
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            log::warn!("outbound verify: request failed: {}", e);
+            return Err(());
+        }
+    };
+    match resp.json::<serde_json::Value>().await {
+        Ok(v) => Ok(v.get("valid").and_then(|x| x.as_bool()).unwrap_or(false)),
+        Err(e) => {
+            log::warn!("outbound verify: parse failed: {}", e);
+            return Err(());
+        }
+    }
+}
+
+// 注册阶段处理出站 token：已缓存且新鲜则复用，否则调用 verify 并落盘结果
+async fn register_outbound(api_url: &str, ip: IpAddr, token: String) {
+    let fresh = {
+        let map = OUTBOUND_IPS.lock().await;
+        map.get(&ip)
+            .map(|e| {
+                e.allowed
+                    && e.token == token
+                    && e.last.elapsed().as_secs() < OUTBOUND_GRANT_SECS
+            })
+            .unwrap_or(false)
+    };
+    if fresh {
+        return;
+    }
+    let ip_str = ip.to_string();
+    match verify_outbound_api(api_url, &token, &ip_str).await {
+        Ok(true) => {
+            OUTBOUND_IPS.lock().await.insert(
+                ip,
+                OutboundIp {
+                    token,
+                    allowed: true,
+                    last: Instant::now(),
+                },
+            );
+            PENDING_OUTBOUND_IPS.lock().await.remove(&ip);
+        }
+        Ok(false) => {
+            // 明确拒绝：不保留缓存，也不进入周期重试
+            OUTBOUND_IPS.lock().await.insert(
+                ip,
+                OutboundIp {
+                    token,
+                    allowed: false,
+                    last: Instant::now(),
+                },
+            );
+        }
+        Err(_) => {
+            // 瞬时故障：fail-closed，进入周期重试以便 api-server 恢复后自动放行
+            OUTBOUND_IPS.lock().await.insert(
+                ip,
+                OutboundIp {
+                    token: token.clone(),
+                    allowed: false,
+                    last: Instant::now(),
+                },
+            );
+            PENDING_OUTBOUND_IPS.lock().await.insert(ip, token);
+        }
+    }
+}
+
+// 周期复核：刷新已授权 IP 窗口，并重试瞬时故障的 IP（消除“校验失败即永久跑死”）
+async fn outbound_periodic_task(api_url: String) {
+    let mut timer = interval(Duration::from_secs(OUTBOUND_RETRY_SECS));
+    loop {
+        timer.tick().await;
+        let to_retry: Vec<(IpAddr, String)> = {
+            let g = PENDING_OUTBOUND_IPS.lock().await;
+            g.iter().map(|(k, v)| (*k, v.clone())).collect()
+        };
+        if to_retry.is_empty() {
+            continue;
+        }
+        for (ip, token) in to_retry {
+            match verify_outbound_api(&api_url, &token, &ip.to_string()).await {
+                Ok(true) => {
+                    OUTBOUND_IPS.lock().await.insert(
+                        ip,
+                        OutboundIp {
+                            token: token.clone(),
+                            allowed: true,
+                            last: Instant::now(),
+                        },
+                    );
+                    PENDING_OUTBOUND_IPS.lock().await.remove(&ip);
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
 #[derive(Clone)]
 struct Inner {
     serial: i32,
@@ -88,6 +233,7 @@ pub struct RendezvousServer {
     relay_servers0: Arc<RelayServers>,
     rendezvous_servers: Arc<Vec<String>>,
     inner: Arc<Inner>,
+    api_url: Option<String>,
 }
 
 enum LoopFailure {
@@ -100,7 +246,7 @@ enum LoopFailure {
 
 impl RendezvousServer {
     pub fn start(port: i32, serial: i32, key: &str, rmem: usize) -> ResultType<()> {
-        Self::start_with_bind(None, port, serial, key, rmem)
+        Self::start_with_bind(None, port, serial, key, rmem, None)
     }
 
     #[tokio::main(flavor = "multi_thread")]
@@ -110,6 +256,7 @@ impl RendezvousServer {
         serial: i32,
         key: &str,
         rmem: usize,
+        api_url: Option<String>,
     ) -> ResultType<()> {
         let (key, sk) = Self::get_server_sk(key);
         let nat_port = port - 1;
@@ -150,9 +297,16 @@ impl RendezvousServer {
                 mask,
                 local_ip,
             }),
+            api_url,
         };
         log::info!("mask: {:?}", rs.inner.mask);
         log::info!("local-ip: {:?}", rs.inner.local_ip);
+        if let Some(api_url) = rs.api_url.clone() {
+            log::info!("出站许可已启用，api-server: {}", api_url);
+            tokio::spawn(outbound_periodic_task(api_url));
+        } else {
+            log::error!("未配置 -a（api-server 地址），出站许可未启用，默认放行全部出站连接（fail-open）。生产环境请务必配置。");
+        }
         std::env::set_var("PORT_FOR_API", port.to_string());
         rs.parse_relay_servers(&get_arg("relay-servers"));
         let mut listener = create_tcp_listener(bind_addr, port).await?;
@@ -367,6 +521,21 @@ impl RendezvousServer {
                             socket.send(&msg_out, addr).await?;
                         }
                     }
+                    // 出站许可：登记/注销 IP 许可缓存（M2）
+                    if let Some(api_url) = self.api_url.clone() {
+                        let ip = try_into_v4(addr).ip();
+                        if rp.outbound_token.is_empty() {
+                            // 未登录/已登出：清除本 IP 的许可缓存（fail-closed）
+                            OUTBOUND_IPS.lock().await.remove(&ip);
+                            PENDING_OUTBOUND_IPS.lock().await.remove(&ip);
+                        } else {
+                            // 后台异步校验，避免阻塞 UDP 注册主循环
+                            let token = rp.outbound_token.clone();
+                            tokio::spawn(async move {
+                                register_outbound(&api_url, ip, token).await;
+                            });
+                        }
+                    }
                 }
                 Some(rendezvous_message::Union::RegisterPk(rk)) => {
                     if rk.uuid.is_empty() || rk.pk.is_empty() {
@@ -523,6 +692,20 @@ impl RendezvousServer {
                     // there maybe several attempt, so sink can be none
                     if let Some(sink) = sink.take() {
                         self.tcp_punch.lock().await.insert(try_into_v4(addr), sink);
+                    }
+                    if !self.outbound_gate(addr).await {
+                        log::warn!(
+                            "outbound relay denied from {} for peer {}: session_required",
+                            addr,
+                            rf.id
+                        );
+                        let mut msg_out = RendezvousMessage::new();
+                        msg_out.set_relay_response(RelayResponse {
+                            refuse_reason: SESSION_REQUIRED_FAIL.to_string(),
+                            ..Default::default()
+                        });
+                        allow_err!(self.send_to_tcp_sync(msg_out, addr).await);
+                        return true;
                     }
                     if let Some(peer) = self.pm.get_in_memory(&rf.id).await {
                         let mut msg_out = RendezvousMessage::new();
@@ -699,7 +882,15 @@ impl RendezvousServer {
         Ok(())
     }
 
-    #[inline]
+    // 出站许可开门（M2）：未配置 -a 时 fail-open（启动时已告警），配置则按 IP 缓存放行
+async fn outbound_gate(&self, addr: SocketAddr) -> bool {
+    match &self.api_url {
+        None => true,
+        Some(_) => ip_outbound_allowed(try_into_v4(addr).ip()).await,
+    }
+}
+
+#[inline]
     async fn handle_punch_hole_request(
         &mut self,
         addr: SocketAddr,
@@ -708,6 +899,19 @@ impl RendezvousServer {
         ws: bool,
     ) -> ResultType<(RendezvousMessage, Option<SocketAddr>)> {
         let mut ph = ph;
+        if !self.outbound_gate(addr).await {
+            log::warn!(
+                "outbound punch denied from {} for peer {}: session_required",
+                addr,
+                ph.id
+            );
+            let mut msg_out = RendezvousMessage::new();
+            msg_out.set_punch_hole_response(PunchHoleResponse {
+                other_failure: SESSION_REQUIRED_FAIL.to_string(),
+                ..Default::default()
+            });
+            return Ok((msg_out, None));
+        }
         if !key.is_empty() && ph.licence_key != key {
             log::warn!("Authentication failed from {} for peer {} - invalid key", addr, ph.id);
             let mut msg_out = RendezvousMessage::new();
